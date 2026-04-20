@@ -1,0 +1,29 @@
+node_modules/
+dist/
+.DS_Store
+.env
+.env.local
+.env.*.local
+.vite/
+coverage/
+*.tsbuildinfo
+.gstack/
+.mcp.json
+supabase/.temp/
+# Repo is npm-first; prevent accidental bun lockfile resurrection.
+bun.lock
+bun.lockb
+
+# Docs: /docs is scratch (gitignored by default), /docs/public is the commit zone.
+# Scratch docs (plans, research, drafts, debates, specs) go directly in /docs —
+# they're ignored by the blanket rule and never committed. Docs that should ship
+# in the public OSS export live in /docs/public/.
+docs/*
+!docs/public/
+
+# Internal AI/operator docs
+AGENTS.md
+.claude/
+CLAUDE.md
+TODOS.md
+supabase/migrations_old/README.md

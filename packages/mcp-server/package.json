@@ -1,0 +1,31 @@
+{
+  "name": "@rocketboard/mcp-server",
+  "private": true,
+  "version": "0.1.0",
+  "license": "FSL-1.1-ALv2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Rocket-Social/rocketboard.git",
+    "directory": "packages/mcp-server"
+  },
+  "homepage": "https://github.com/Rocket-Social/rocketboard/tree/main/packages/mcp-server",
+  "bugs": {
+    "url": "https://github.com/Rocket-Social/rocketboard/issues"
+  },
+  "type": "module",
+  "bin": {
+    "rocketboard-mcp": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "setup:claude": "node ./dist/cli.js setup claude",
+    "serve": "node ./dist/cli.js serve",
+    "serve:http": "node ./dist/cli.js serve-http",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@supabase/supabase-js": "^2.99.3",
+    "zod": "^4.3.6"
+  }
+}
