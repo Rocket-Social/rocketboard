@@ -1,0 +1,138 @@
+project_id = "Rocketboard"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 17
+
+[db.migrations]
+enabled = true
+schema_paths = []
+
+[db.seed]
+enabled = true
+sql_paths = ["./seed.sql"]
+
+[realtime]
+enabled = true
+
+[studio]
+enabled = true
+port = 54323
+api_url = "http://127.0.0.1"
+
+[inbucket]
+enabled = true
+port = 54324
+
+[storage]
+enabled = true
+file_size_limit = "50MiB"
+
+[storage.s3_protocol]
+enabled = true
+
+[functions.github-oauth]
+verify_jwt = false
+
+[functions.github-install]
+verify_jwt = false
+
+[functions.github-repos]
+verify_jwt = false
+
+[functions.github-sync]
+verify_jwt = false
+
+[functions.github-validate-token]
+verify_jwt = false
+
+[functions.jira-oauth]
+verify_jwt = false
+
+[functions.jira-sync]
+verify_jwt = false
+
+[functions.github-webhook]
+verify_jwt = false
+
+[functions.send-invite-email]
+verify_jwt = false
+
+[functions.send-invite-request-notification]
+verify_jwt = false
+
+[functions.granola-import]
+verify_jwt = false
+
+[functions.ai-key-manage]
+verify_jwt = false
+
+[functions.ai-chat]
+verify_jwt = false
+
+[functions.anthropic-subscription-auth]
+verify_jwt = false
+
+[functions.stripe-webhook]
+verify_jwt = false
+
+[functions.billing-checkout]
+verify_jwt = false
+
+[functions.billing-invoices]
+verify_jwt = false
+
+[functions.billing-payment-method]
+verify_jwt = false
+
+[functions.billing-portal-session]
+verify_jwt = false
+
+[functions.super-admin-org-vip]
+verify_jwt = false
+
+[functions.deploy-health]
+verify_jwt = false
+
+[functions.drift-watcher]
+verify_jwt = false
+
+[functions.ai-agent-run]
+verify_jwt = false
+
+[auth]
+enabled = true
+site_url = "http://127.0.0.1:5173"
+additional_redirect_urls = [
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:5173/auth/callback",
+  "http://127.0.0.1:5173/reset-password",
+  "http://localhost:5173/auth/callback",
+  "http://localhost:5173/reset-password",
+  "https://rocketboard.app/auth/callback",
+  "https://rocketboard-app.pages.dev/auth/callback",
+]
+jwt_expiry = 3600
+enable_refresh_token_rotation = true
+refresh_token_reuse_interval = 10
+enable_signup = true
+enable_anonymous_sign_ins = false
+enable_manual_linking = true
+minimum_password_length = 6
+password_requirements = ""
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+enable_confirmations = false
+max_frequency = "1s"
+otp_length = 6
+otp_expiry = 3600

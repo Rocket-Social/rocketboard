@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  migration-guard:
+    runs-on: ubuntu-latest
+    outputs:
+      sql_affecting: ${{ steps.detect-sql.outputs.sql_affecting }}
+      sql_from_ref: ${{ steps.compare-ref.outputs.from_ref }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Resolve compare ref
+        id: compare-ref
+        shell: bash
+        run: |
+          from_ref=""
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Do NOT pass --depth=1 here. The checkout step above uses
+            # fetch-depth: 0 (full history). Re-fetching the base branch with
+            # --depth=1 installs a shallow graft on its tip, which makes
+            # `git merge-base` unable to walk past that commit and causes
+            # `check:migrations --from-ref origin/<base>` to fail with
+            # "fatal: origin/<base>...HEAD: no merge base". The force-push +
+            # rebase flow on PR #266 hit this deterministically when main had
+            # advanced between the original PR open and the rebase push.
+            git fetch --no-tags --prune origin "${{ github.base_ref }}"
+            from_ref="origin/${{ github.base_ref }}"
+          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            from_ref="${{ github.event.before }}"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            from_ref="HEAD^"
+          fi
+
+          echo "from_ref=$from_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check migration history
+        shell: bash
+        run: |
+          if [ -n "${{ steps.compare-ref.outputs.from_ref }}" ]; then
+            npm run check:migrations -- --from-ref "${{ steps.compare-ref.outputs.from_ref }}"
+          else
+            npm run check:migrations
+          fi
+
+      - name: Detect SQL-affecting changes
+        id: detect-sql
+        env:
+          FROM_REF: ${{ steps.compare-ref.outputs.from_ref }}
+        run: |
+          node --input-type=module <<'NODE' >> "$GITHUB_OUTPUT"
+          import { execFileSync } from 'node:child_process'
+          import { classifyPathsToSurfaces } from './scripts/classify-paths.mjs'
+
+          const fromRef = process.env.FROM_REF || ''
+          const diffArgs = fromRef
+            ? ['diff', '--name-only', `${fromRef}...HEAD`]
+            : ['show', '--pretty=format:', '--name-only', 'HEAD']
+          const output = execFileSync('git', diffArgs, { encoding: 'utf8' })
+          const paths = output.split('\n').map((value) => value.trim()).filter(Boolean)
+          const sqlAffecting = classifyPathsToSurfaces(paths).includes('sql')
+
+          console.log(`sql_affecting=${sqlAffecting ? 'true' : 'false'}`)
+          NODE
+
+  sql-verify:
+    needs: migration-guard
+    if: needs.migration-guard.outputs.sql_affecting == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: 2.84.2
+
+      - name: Verify SQL reset replay
+        run: npm run sql:verify:reset
+
+      - name: Verify SQL upgrade replay
+        run: npm run sql:verify:upgrade -- --from-ref "${{ needs.migration-guard.outputs.sql_from_ref }}"
+
+      - name: Verify migration schema contract
+        run: npx vitest run src/sql/migration-contract.test.ts
+
+  validate:
+    needs: migration-guard
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check function secret manifest
+        run: npm run check:function-secrets
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high || true
+
+      - name: Test
+        run: npm test
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Restore Playwright Chromium cache
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright Chromium
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Validate Playwright Chromium cache
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install chromium
+
+      - name: VIP browser flow
+        run: npm run test:e2e:vip
+
+      - name: Check bundle budget
+        run: npm run check:bundle-budget

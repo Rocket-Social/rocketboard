@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f8fafc" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Rocketboard</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+    // Layer 1: Catch stale chunk errors globally — works even on old builds.
+    // When a deploy removes old chunks, dynamic imports fail with a TypeError.
+    // This handler auto-reloads once to pick up the new build.
+    window.addEventListener('unhandledrejection', function(e) {
+      var msg = e && e.reason && e.reason.message;
+      if (typeof msg === 'string' && msg.indexOf('dynamically imported module') !== -1) {
+        var key = '__chunk_reload';
+        if (!sessionStorage.getItem(key)) {
+          sessionStorage.setItem(key, '1');
+          location.reload();
+        } else {
+          sessionStorage.removeItem(key);
+        }
+      }
+    });
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+  </html>

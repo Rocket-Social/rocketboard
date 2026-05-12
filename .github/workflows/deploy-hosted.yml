@@ -1,0 +1,265 @@
+name: Deploy Hosted
+run-name: ${{ inputs.environment }}:${{ inputs.sha }}:${{ inputs.surfaces }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Hosted environment to deploy
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      sha:
+        description: Exact merged SHA to deploy
+        required: true
+        type: string
+      surfaces:
+        description: Comma-separated surfaces to deploy (sql,edge,frontend)
+        required: true
+        type: string
+      bypass_staging_guard:
+        description: Allow direct production deploy without staging validation
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: deploy-hosted-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      actions: read
+      contents: read
+
+    env:
+      DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+      DEPLOY_SHA: ${{ inputs.sha }}
+      DEPLOY_SURFACES: ${{ inputs.surfaces }}
+      BYPASS_STAGING_GUARD: ${{ inputs.bypass_staging_guard }}
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      SUPABASE_DB_HOST: ${{ secrets.SUPABASE_DB_HOST }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+      VITE_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+      VITE_POSTHOG_KEY: ${{ secrets.POSTHOG_PROJECT_TOKEN }}
+      VITE_POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
+      VITE_GIT_SHA: ${{ inputs.sha }}
+      # Enable /dev/throw smoke route only in staging builds so we can verify
+      # monitoring end-to-end post-deploy. Production deploys omit this so the
+      # route short-circuits to `return null` (see src/dev/DevThrowPage.tsx).
+      VITE_ALLOW_SMOKE: ${{ inputs.environment == 'staging' && 'true' || 'false' }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_PAGES_PROJECT: ${{ secrets.CLOUDFLARE_PAGES_PROJECT }}
+      APP_URL: ${{ secrets.APP_URL }}
+      CLOUDFLARE_PAGES_BRANCH: ${{ inputs.environment == 'production' && 'main' || 'staging' }}
+
+    steps:
+      - name: Check required secrets
+        run: |
+          missing=()
+
+          require_secret() {
+            local name="$1"
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          }
+
+          if [[ "$DEPLOY_SURFACES" == *"frontend"* ]]; then
+            for name in SUPABASE_URL SUPABASE_PUBLISHABLE_KEY CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN CLOUDFLARE_PAGES_PROJECT APP_URL; do
+              require_secret "$name"
+            done
+          fi
+
+          if [[ "$DEPLOY_SURFACES" == *"edge"* ]]; then
+            for name in SUPABASE_ACCESS_TOKEN SUPABASE_PROJECT_REF; do
+              require_secret "$name"
+            done
+          fi
+
+          if [[ "$DEPLOY_SURFACES" == *"sql"* ]]; then
+            for name in SUPABASE_PROJECT_REF; do
+              require_secret "$name"
+            done
+            if [ -z "${SUPABASE_DB_PASSWORD}" ] && [ -z "${SUPABASE_ACCESS_TOKEN}" ]; then
+              missing+=("SUPABASE_DB_PASSWORD or SUPABASE_ACCESS_TOKEN")
+            fi
+          fi
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required deploy secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Enforce staging promotion for production
+        if: inputs.environment == 'production' && inputs.bypass_staging_guard == false
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const targetTitle = `staging:${process.env.DEPLOY_SHA}:${process.env.DEPLOY_SURFACES}`
+            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+              owner,
+              repo,
+              event: 'workflow_dispatch',
+              per_page: 100,
+            })
+
+            const matching = runs.find((run) =>
+              (run.display_title === targetTitle || run.name === targetTitle)
+              && run.conclusion === 'success'
+            )
+
+            if (!matching) {
+              core.setFailed(`Production deploy blocked. No successful staging deploy found for ${process.env.DEPLOY_SHA} (${process.env.DEPLOY_SURFACES}).`)
+            }
+
+      - name: Checkout workflow SHA
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Validate Supabase target consistency
+        run: node scripts/validate-hosted-deploy-env.mjs
+
+      - name: Checkout target SHA
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.sha }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup Supabase CLI
+        if: contains(inputs.surfaces, 'sql') || contains(inputs.surfaces, 'edge')
+        uses: supabase/setup-cli@v1
+        with:
+          version: 2.84.2
+
+      - name: Create temporary CLI database login
+        if: contains(inputs.surfaces, 'sql') && env.SUPABASE_DB_PASSWORD == '' && env.SUPABASE_ACCESS_TOKEN != ''
+        run: |
+          response=$(curl -fsS \
+            -X POST \
+            -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.supabase.com/v1/projects/$SUPABASE_PROJECT_REF/cli/login-role" \
+            -d '{"read_only":false}')
+          db_host="${SUPABASE_DB_HOST:-db.${SUPABASE_PROJECT_REF}.supabase.co}"
+          db_user=$(node --input-type=module -e "import { formatSupabaseDbUser } from './scripts/validate-hosted-deploy-env.mjs'; process.stdout.write(formatSupabaseDbUser({ dbHost: process.argv[1], projectRef: process.env.SUPABASE_PROJECT_REF, user: 'cli_login_postgres' }));" "$db_host")
+          password=$(node -e "const data = JSON.parse(process.argv[1]); if (!data.password) throw new Error('No temporary database password returned.'); process.stdout.write(data.password);" "$response")
+          echo "::add-mask::$password"
+          echo "SUPABASE_DB_USER=$db_user" >> "$GITHUB_ENV"
+          echo "SUPABASE_DB_PASSWORD=$password" >> "$GITHUB_ENV"
+
+      - name: Resolve effective SQL host address
+        if: contains(inputs.surfaces, 'sql') && env.SUPABASE_EFFECTIVE_DB_HOSTADDR == ''
+        run: |
+          db_host="${SUPABASE_EFFECTIVE_DB_HOST:-${SUPABASE_DB_HOST:-db.${SUPABASE_PROJECT_REF}.supabase.co}}"
+          db_port="${SUPABASE_EFFECTIVE_DB_PORT:-5432}"
+          hostaddr=$(node -e "const dns = require('node:dns').promises; dns.lookup(process.argv[1], { family: 4 }).then(({ address }) => process.stdout.write(address)).catch(() => {});" "$db_host")
+          echo "SUPABASE_EFFECTIVE_DB_HOST=$db_host" >> "$GITHUB_ENV"
+          echo "SUPABASE_EFFECTIVE_DB_PORT=$db_port" >> "$GITHUB_ENV"
+          if [ -n "$hostaddr" ]; then
+            echo "SUPABASE_EFFECTIVE_DB_HOSTADDR=$hostaddr" >> "$GITHUB_ENV"
+          fi
+
+      - name: Apply database migrations
+        if: contains(inputs.surfaces, 'sql')
+        run: |
+          encoded_password=$(node -e "process.stdout.write(encodeURIComponent(process.env.SUPABASE_DB_PASSWORD || ''))")
+          db_host="${SUPABASE_EFFECTIVE_DB_HOST:-${SUPABASE_DB_HOST:-db.${SUPABASE_PROJECT_REF}.supabase.co}}"
+          db_port="${SUPABASE_EFFECTIVE_DB_PORT:-5432}"
+          db_user=$(node --input-type=module -e "import { formatSupabaseDbUser } from './scripts/validate-hosted-deploy-env.mjs'; process.stdout.write(formatSupabaseDbUser({ dbHost: process.argv[1], projectRef: process.env.SUPABASE_PROJECT_REF, user: process.env.SUPABASE_DB_USER || 'postgres' }));" "$db_host")
+          db_url="postgresql://${db_user}:${encoded_password}@${db_host}:${db_port}/postgres?sslmode=require"
+          if [ -n "${SUPABASE_EFFECTIVE_DB_HOSTADDR:-}" ]; then
+            db_url="${db_url}&hostaddr=${SUPABASE_EFFECTIVE_DB_HOSTADDR}"
+          fi
+          # One-time 2026-04 consolidation cutover: strip the folded migration
+          # versions from schema_migrations before db push. Idempotent —
+          # deletes 0 rows on subsequent runs. Script has its own preflight
+          # guard that fails loudly on a drifted DB (partial state).
+          # ON_ERROR_STOP=1 ensures that preflight raise_exception aborts
+          # the deploy before db push can corrupt anything.
+          if [ -f scripts/consolidation-cutover-2026-04.sql ]; then
+            psql "$db_url" -v ON_ERROR_STOP=1 -f scripts/consolidation-cutover-2026-04.sql
+          fi
+          supabase db push --db-url "$db_url"
+
+      - name: Reload PostgREST schema cache
+        if: contains(inputs.surfaces, 'sql')
+        run: |
+          encoded_password=$(node -e "process.stdout.write(encodeURIComponent(process.env.SUPABASE_DB_PASSWORD || ''))")
+          db_host="${SUPABASE_EFFECTIVE_DB_HOST:-${SUPABASE_DB_HOST:-db.${SUPABASE_PROJECT_REF}.supabase.co}}"
+          db_port="${SUPABASE_EFFECTIVE_DB_PORT:-5432}"
+          db_user=$(node --input-type=module -e "import { formatSupabaseDbUser } from './scripts/validate-hosted-deploy-env.mjs'; process.stdout.write(formatSupabaseDbUser({ dbHost: process.argv[1], projectRef: process.env.SUPABASE_PROJECT_REF, user: process.env.SUPABASE_DB_USER || 'postgres' }));" "$db_host")
+          db_url="postgresql://${db_user}:${encoded_password}@${db_host}:${db_port}/postgres?sslmode=require"
+          if [ -n "${SUPABASE_EFFECTIVE_DB_HOSTADDR:-}" ]; then
+            db_url="${db_url}&hostaddr=${SUPABASE_EFFECTIVE_DB_HOSTADDR}"
+          fi
+          psql "$db_url" -v ON_ERROR_STOP=1 -c "NOTIFY pgrst, 'reload schema';"
+
+      - name: Deploy edge functions
+        if: contains(inputs.surfaces, 'edge')
+        run: |
+          for fn in $(find supabase/functions -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | sort); do
+            if [ "$fn" = "_shared" ]; then
+              continue
+            fi
+            if [ ! -f "supabase/functions/$fn/index.ts" ]; then
+              echo "Skipping $fn because no index.ts entrypoint exists."
+              continue
+            fi
+            supabase functions deploy "$fn" --project-ref "$SUPABASE_PROJECT_REF" --use-api
+          done
+
+      - name: Backend smoke check
+        if: contains(inputs.surfaces, 'sql') || contains(inputs.surfaces, 'edge')
+        run: |
+          supabase functions list --project-ref "$SUPABASE_PROJECT_REF"
+          if [[ "$DEPLOY_SURFACES" == *"sql"* ]]; then
+            encoded_password=$(node -e "process.stdout.write(encodeURIComponent(process.env.SUPABASE_DB_PASSWORD || ''))")
+            db_host="${SUPABASE_EFFECTIVE_DB_HOST:-${SUPABASE_DB_HOST:-db.${SUPABASE_PROJECT_REF}.supabase.co}}"
+            db_port="${SUPABASE_EFFECTIVE_DB_PORT:-5432}"
+            db_user=$(node --input-type=module -e "import { formatSupabaseDbUser } from './scripts/validate-hosted-deploy-env.mjs'; process.stdout.write(formatSupabaseDbUser({ dbHost: process.argv[1], projectRef: process.env.SUPABASE_PROJECT_REF, user: process.env.SUPABASE_DB_USER || 'postgres' }));" "$db_host")
+            db_url="postgresql://${db_user}:${encoded_password}@${db_host}:${db_port}/postgres?sslmode=require"
+            if [ -n "${SUPABASE_EFFECTIVE_DB_HOSTADDR:-}" ]; then
+              db_url="${db_url}&hostaddr=${SUPABASE_EFFECTIVE_DB_HOSTADDR}"
+            fi
+            psql "$db_url" -c "select 1;"
+          fi
+
+      - name: Build frontend
+        if: contains(inputs.surfaces, 'frontend')
+        run: npm run build
+
+      - name: Deploy frontend
+        if: contains(inputs.surfaces, 'frontend')
+        run: |
+          npx wrangler pages deploy dist \
+            --project-name "$CLOUDFLARE_PAGES_PROJECT" \
+            --branch "$CLOUDFLARE_PAGES_BRANCH" \
+            --commit-hash "$DEPLOY_SHA" \
+            --commit-message "Deploy Hosted ${DEPLOY_ENVIRONMENT}:${DEPLOY_SHA}"
+
+      - name: Frontend smoke check
+        if: contains(inputs.surfaces, 'frontend')
+        run: curl -fsS "$APP_URL" > /dev/null
